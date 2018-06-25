@@ -27,6 +27,7 @@
 #include <crypto/hashers/hash_algorithm_set.h>
 #include <encoding/payloads/sa_payload.h>
 #include <encoding/payloads/ke_payload.h>
+#include <encoding/payloads/qske_payload.h>
 #include <encoding/payloads/nonce_payload.h>
 
 /** maximum retries to do with cookies/other dh groups */
@@ -68,6 +69,16 @@ struct private_ike_init_t {
 	 * Applying DH public value failed?
 	 */
 	bool dh_failed;
+
+	/**
+	 * QSKE mechanism implementation
+	 */
+	qske_t *qske;
+
+	/**
+	 * Creating QSKE implementation failed
+	 */
+	bool qske_failed;
 
 	/**
 	 * Keymat derivation (from IKE_SA)
@@ -469,6 +480,7 @@ static void process_payloads(private_ike_init_t *this, message_t *message)
 	enumerator_t *enumerator;
 	payload_t *payload;
 	ke_payload_t *ke_payload = NULL;
+	uint16_t qske_mechanism;
 
 	enumerator = message->create_payload_enumerator(message);
 	while (enumerator->enumerate(enumerator, &payload))
@@ -569,6 +581,28 @@ static void process_payloads(private_ike_init_t *this, message_t *message)
 								ke_payload->get_key_exchange_data(ke_payload));
 		}
 	}
+	if (this->proposal && !this->dh_failed &&
+		this->proposal->get_algorithm(this->proposal, QSKE_MECHANISM,
+									  &qske_mechanism, NULL))
+	{
+		this->qske = this->keymat->create_qske(this->keymat, qske_mechanism);
+		this->qske_failed = !this->qske;
+	}
+}
+
+METHOD(task_t, build_i_qske, status_t,
+	private_ike_init_t *this, message_t *message)
+{
+	qske_payload_t *qske;
+
+	message->set_exchange_type(message, IKE_AUX);
+	qske = qske_payload_create_from_qske(this->qske, TRUE);
+	if (!qske)
+	{
+		return FAILED;
+	}
+	message->add_payload(message, (payload_t*)qske);
+	return NEED_MORE;
 }
 
 METHOD(task_t, build_i, status_t,
@@ -577,7 +611,6 @@ METHOD(task_t, build_i, status_t,
 	ike_cfg_t *ike_cfg;
 
 	ike_cfg = this->ike_sa->get_ike_cfg(this->ike_sa);
-
 	DBG0(DBG_IKE, "initiating IKE_SA %s[%d] to %H",
 		 this->ike_sa->get_name(this->ike_sa),
 		 this->ike_sa->get_unique_id(this->ike_sa),
@@ -668,6 +701,36 @@ METHOD(task_t, build_i, status_t,
 	return NEED_MORE;
 }
 
+METHOD(task_t, process_r_qske,  status_t,
+	private_ike_init_t *this, message_t *message)
+{
+	qske_payload_t *qske;
+
+	if (message->get_exchange_type(message) == IKE_AUX)
+	{
+		qske = (qske_payload_t*)message->get_payload(message, PLV2_QSKE);
+		if (qske)
+		{
+			if (this->qske->set_public_key(this->qske,
+										   qske->get_qske_data(qske)))
+			{
+				return NEED_MORE;
+			}
+			else
+			{
+				DBG1(DBG_IKE, "failed to set QSKE public key");
+			}
+		}
+		else
+		{
+			DBG1(DBG_IKE, "QSKE payload missing in message");
+		}
+	}
+	DESTROY_IF(this->qske);
+	this->qske = NULL;
+	return NEED_MORE;
+}
+
 METHOD(task_t, process_r,  status_t,
 	private_ike_init_t *this, message_t *message)
 {
@@ -701,7 +764,7 @@ METHOD(task_t, process_r,  status_t,
  * Derive the keymat for the IKE_SA
  */
 static bool derive_keys(private_ike_init_t *this,
-						chunk_t nonce_i, chunk_t nonce_r)
+						chunk_t nonce_i, chunk_t nonce_r, qske_t *qske)
 {
 	keymat_v2_t *old_keymat;
 	pseudo_random_function_t prf_alg = PRF_UNDEFINED;
@@ -709,28 +772,88 @@ static bool derive_keys(private_ike_init_t *this,
 	ike_sa_id_t *id;
 
 	id = this->ike_sa->get_id(this->ike_sa);
-	if (this->old_sa)
+	if (qske)
 	{
-		/* rekeying: Include old SKd, use old PRF, apply SPI */
-		old_keymat = (keymat_v2_t*)this->old_sa->get_keymat(this->old_sa);
-		prf_alg = old_keymat->get_skd(old_keymat, &skd);
-		if (this->initiator)
+		/* similar to a rekeying we just use SK_d derived from the classic DH
+		 * SKEYSEED = prf(SK_d (classic), QSKE | Ni | Nr) */
+		prf_alg = this->keymat->get_skd(this->keymat, &skd);
+		if (!this->keymat->derive_ike_keys(this->keymat, this->proposal,
+										   NULL, qske, nonce_i, nonce_r, id,
+										   prf_alg, skd))
 		{
-			id->set_responder_spi(id, this->proposal->get_spi(this->proposal));
-		}
-		else
-		{
-			id->set_initiator_spi(id, this->proposal->get_spi(this->proposal));
+			return FALSE;
 		}
 	}
-	if (!this->keymat->derive_ike_keys(this->keymat, this->proposal, this->dh,
-									NULL, nonce_i, nonce_r, id, prf_alg, skd))
+	else
 	{
-		return FALSE;
+		if (this->old_sa)
+		{
+			if (this->initiator)
+			{
+				id->set_responder_spi(id,
+									  this->proposal->get_spi(this->proposal));
+			}
+			else
+			{
+				id->set_initiator_spi(id,
+									  this->proposal->get_spi(this->proposal));
+			}
+			old_keymat = (keymat_v2_t*)this->old_sa->get_keymat(this->old_sa);
+			prf_alg = old_keymat->get_skd(old_keymat, &skd);
+		}
+		if (!this->keymat->derive_ike_keys(this->keymat, this->proposal,
+										   this->dh, NULL, nonce_i, nonce_r, id,
+										   prf_alg, skd))
+		{
+			return FALSE;
+		}
+		charon->bus->ike_keys(charon->bus, this->ike_sa, this->dh, chunk_empty,
+							  nonce_i, nonce_r, this->old_sa, NULL);
 	}
-	charon->bus->ike_keys(charon->bus, this->ike_sa, this->dh, chunk_empty,
-						  nonce_i, nonce_r, this->old_sa, NULL);
 	return TRUE;
+}
+
+METHOD(task_t, post_build_r, status_t,
+	private_ike_init_t *this, message_t *message)
+{
+	if (message->get_exchange_type(message) == IKE_AUX)
+	{
+		if (!derive_keys(this, this->other_nonce, this->my_nonce, this->qske))
+		{
+			DBG1(DBG_IKE, "QSKE key derivation failed");
+			/* FIXME: we can't send an error notify at this point */
+			return FAILED;
+		}
+		return SUCCESS;
+	}
+	return NEED_MORE;
+}
+
+METHOD(task_t, build_r_qske, status_t,
+	private_ike_init_t *this, message_t *message)
+{
+	qske_payload_t *qske;
+
+	if (!this->qske)
+	{
+		/* FIXME: use NO_PROPOSAL_CHOSEN instead? */
+		message->add_notify(message, FALSE, INVALID_SYNTAX, chunk_empty);
+		return FAILED;
+	}
+
+	qske = qske_payload_create_from_qske(this->qske, FALSE);
+	if (!qske)
+	{
+		DBG1(DBG_IKE, "failed to create QSKE payload");
+		/* FIXME: better error notify? */
+		message->add_notify(message, FALSE, NO_PROPOSAL_CHOSEN, chunk_empty);
+		return FAILED;
+	}
+	message->add_payload(message, (payload_t*)qske);
+	/* we do the key derivation in post_build(), otherwise the response
+	 * would be generated using the wrong keys */
+	this->public.task.post_build = _post_build_r;
+	return NEED_MORE;
 }
 
 METHOD(task_t, build_r, status_t,
@@ -794,7 +917,14 @@ METHOD(task_t, build_r, status_t,
 		return FAILED;
 	}
 
-	if (!derive_keys(this, this->other_nonce, this->my_nonce))
+	if (this->qske_failed)
+	{
+		DBG1(DBG_IKE, "creating QSKE implementation failed");
+		message->add_notify(message, TRUE, NO_PROPOSAL_CHOSEN, chunk_empty);
+		return FAILED;
+	}
+
+	if (!derive_keys(this, this->other_nonce, this->my_nonce, NULL))
 	{
 		DBG1(DBG_IKE, "key derivation failed");
 		message->add_notify(message, TRUE, NO_PROPOSAL_CHOSEN, chunk_empty);
@@ -804,6 +934,12 @@ METHOD(task_t, build_r, status_t,
 	{
 		message->add_notify(message, TRUE, NO_PROPOSAL_CHOSEN, chunk_empty);
 		return FAILED;
+	}
+	if (this->qske)
+	{
+		this->public.task.build = _build_r_qske;
+		this->public.task.process = _process_r_qske;
+		return NEED_MORE;
 	}
 	return SUCCESS;
 }
@@ -874,6 +1010,30 @@ METHOD(task_t, pre_process_i, status_t,
 		}
 	}
 	enumerator->destroy(enumerator);
+	return SUCCESS;
+}
+
+METHOD(task_t, process_i_qske, status_t,
+	private_ike_init_t *this, message_t *message)
+{
+	qske_payload_t *qske;
+
+	qske = (qske_payload_t*)message->get_payload(message, PLV2_QSKE);
+	if (!qske)
+	{
+		DBG1(DBG_IKE, "QSKE payload missing in message");
+		return FAILED;
+	}
+	if (!this->qske->set_ciphertext(this->qske, qske->get_qske_data(qske)))
+	{
+		DBG1(DBG_IKE, "failed to decrypt QSKE shared secret");
+		return FAILED;
+	}
+	if (!derive_keys(this, this->my_nonce, this->other_nonce, this->qske))
+	{
+		DBG1(DBG_IKE, "QSKE key derivation failed");
+		return FAILED;
+	}
 	return SUCCESS;
 }
 
@@ -997,10 +1157,22 @@ METHOD(task_t, process_i, status_t,
 		return FAILED;
 	}
 
-	if (!derive_keys(this, this->my_nonce, this->other_nonce))
+	if (this->qske_failed)
+	{
+		DBG1(DBG_IKE, "creating QSKE implementation failed");
+		return FAILED;
+	}
+
+	if (!derive_keys(this, this->my_nonce, this->other_nonce, NULL))
 	{
 		DBG1(DBG_IKE, "key derivation failed");
 		return FAILED;
+	}
+	if (this->qske)
+	{
+		this->public.task.build = _build_i_qske;
+		this->public.task.process = _process_i_qske;
+		return NEED_MORE;
 	}
 	return SUCCESS;
 }
@@ -1021,12 +1193,14 @@ METHOD(task_t, migrate, void,
 	this->keymat = (keymat_v2_t*)ike_sa->get_keymat(ike_sa);
 	this->proposal = NULL;
 	this->dh_failed = FALSE;
+	this->qske_failed = FALSE;
 }
 
 METHOD(task_t, destroy, void,
 	private_ike_init_t *this)
 {
 	DESTROY_IF(this->dh);
+	DESTROY_IF(this->qske);
 	DESTROY_IF(this->proposal);
 	DESTROY_IF(this->nonceg);
 	chunk_free(&this->my_nonce);
