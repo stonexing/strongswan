@@ -31,10 +31,22 @@
 })
 
 /**
+ * Default config for QSKE tests
+ */
+static exchange_test_sa_conf_t qske_conf = {
+	.initiator = {
+		.ike = "aes256gcm16-prfsha256-modp3072-qskenewhope5",
+	},
+	.responder = {
+		.ike = "aes256gcm16-prfsha256-modp3072-qskenewhope5",
+	},
+};
+
+/**
  * Regular IKE_SA rekeying either initiated by the original initiator or
  * responder of the IKE_SA.
  */
-START_TEST(test_regular)
+static void _test_regular(int _i, bool qske, exchange_test_sa_conf_t *conf)
 {
 	ike_sa_t *a, *b, *new_sa;
 	status_t s;
@@ -42,12 +54,12 @@ START_TEST(test_regular)
 	if (_i)
 	{	/* responder rekeys the IKE_SA */
 		exchange_test_helper->establish_sa(exchange_test_helper,
-										   &b, &a, NULL);
+										   &b, &a, conf);
 	}
 	else
 	{	/* initiator rekeys the IKE_SA */
 		exchange_test_helper->establish_sa(exchange_test_helper,
-										   &a, &b, NULL);
+										   &a, &b, conf);
 	}
 	/* these should never get called as this results in a successful rekeying */
 	assert_hook_not_called(ike_updown);
@@ -55,7 +67,26 @@ START_TEST(test_regular)
 
 	initiate_rekey(a);
 
-	/* CREATE_CHILD_SA { SA, Ni, KEi } --> */
+	if (qske)
+	{
+		assert_hook_not_called(ike_rekey);
+		/* CREATE_CHILD_SA { SA, Ni, KEi } --> */
+		assert_no_notify(IN, REKEY_SA);
+		exchange_test_helper->process_message(exchange_test_helper, b, NULL);
+		assert_ike_sa_state(b, IKE_ESTABLISHED);
+		assert_child_sa_count(b, 1);
+		assert_ike_sa_count(0);
+
+		/* <-- CREATE_CHILD_SA { SA, Nr, KEr } */
+		assert_no_notify(IN, REKEY_SA);
+		exchange_test_helper->process_message(exchange_test_helper, a, NULL);
+		assert_ike_sa_state(a, IKE_REKEYING);
+		assert_child_sa_count(a, 1);
+		assert_ike_sa_count(0);
+		assert_hook();
+	}
+
+	/* CREATE_CHILD_SA { SA, Ni, KEi } | IKE_AUX { QSKE } --> */
 	assert_hook_rekey(ike_rekey, 1, 3);
 	assert_no_notify(IN, REKEY_SA);
 	exchange_test_helper->process_message(exchange_test_helper, b, NULL);
@@ -67,7 +98,7 @@ START_TEST(test_regular)
 	assert_ike_sa_count(1);
 	assert_hook();
 
-	/* <-- CREATE_CHILD_SA { SA, Nr, KEr } */
+	/* <-- CREATE_CHILD_SA { SA, Nr, KEr } | IKE_AUX { QSKE } */
 	assert_hook_rekey(ike_rekey, 1, 3);
 	assert_no_notify(IN, REKEY_SA);
 	exchange_test_helper->process_message(exchange_test_helper, a, NULL);
@@ -78,6 +109,7 @@ START_TEST(test_regular)
 	assert_child_sa_count(new_sa, 1);
 	assert_ike_sa_count(2);
 	assert_hook();
+
 
 	/* we don't expect this hook to get called anymore */
 	assert_hook_not_called(ike_rekey);
@@ -100,6 +132,17 @@ START_TEST(test_regular)
 
 	charon->ike_sa_manager->flush(charon->ike_sa_manager);
 }
+
+START_TEST(test_regular)
+{
+	_test_regular(_i, FALSE, NULL);
+}
+END_TEST
+
+START_TEST(test_regular_qske)
+{
+	_test_regular(_i, TRUE, &qske_conf);
+}
 END_TEST
 
 /**
@@ -107,16 +150,9 @@ END_TEST
  * by the initiator, either initiated by the original initiator or responder of
  * the IKE_SA.
  */
-START_TEST(test_regular_ke_invalid)
+static void _test_regular_ke_invalid(int _i, bool qske,
+									 exchange_test_sa_conf_t *conf)
 {
-	exchange_test_sa_conf_t conf = {
-		.initiator = {
-			.ike = "aes128-sha256-modp2048-modp3072",
-		},
-		.responder = {
-			.ike = "aes128-sha256-modp3072-modp2048",
-		},
-	};
 	ike_sa_t *a, *b, *sa;
 	status_t s;
 
@@ -125,12 +161,12 @@ START_TEST(test_regular_ke_invalid)
 	if (_i)
 	{	/* responder rekeys the IKE_SA */
 		exchange_test_helper->establish_sa(exchange_test_helper,
-										   &b, &a, &conf);
+										   &b, &a, conf);
 	}
 	else
 	{	/* initiator rekeys the IKE_SA */
 		exchange_test_helper->establish_sa(exchange_test_helper,
-										   &a, &b, &conf);
+										   &a, &b, conf);
 	}
 	/* these should never get called as this results in a successful rekeying */
 	assert_hook_not_called(ike_updown);
@@ -158,7 +194,24 @@ START_TEST(test_regular_ke_invalid)
 	assert_ike_sa_count(0);
 	assert_hook();
 
-	/* CREATE_CHILD_SA { SA, Ni, KEi } --> */
+	if (qske)
+	{
+		assert_hook_not_called(ike_rekey);
+		/* CREATE_CHILD_SA { SA, Ni, KEi } --> */
+		exchange_test_helper->process_message(exchange_test_helper, b, NULL);
+		assert_ike_sa_state(b, IKE_ESTABLISHED);
+		assert_child_sa_count(b, 1);
+		assert_ike_sa_count(0);
+
+		/* <-- CREATE_CHILD_SA { SA, Nr, KEr } */
+		exchange_test_helper->process_message(exchange_test_helper, a, NULL);
+		assert_ike_sa_state(a, IKE_REKEYING);
+		assert_child_sa_count(a, 1);
+		assert_ike_sa_count(0);
+		assert_hook();
+	}
+
+	/* CREATE_CHILD_SA { SA, Ni, KEi } | IKE_AUX { QSKE } --> */
 	assert_hook_rekey(ike_rekey, 1, 3);
 	exchange_test_helper->process_message(exchange_test_helper, b, NULL);
 	assert_ike_sa_state(b, IKE_REKEYED);
@@ -169,7 +222,7 @@ START_TEST(test_regular_ke_invalid)
 	assert_ike_sa_count(1);
 	assert_hook();
 
-	/* <-- CREATE_CHILD_SA { SA, Nr, KEr } */
+	/* <-- CREATE_CHILD_SA { SA, Nr, KEr } | IKE_AUX { QSKE } */
 	assert_hook_rekey(ike_rekey, 1, 3);
 	exchange_test_helper->process_message(exchange_test_helper, a, NULL);
 	assert_ike_sa_state(a, IKE_DELETING);
@@ -201,19 +254,46 @@ START_TEST(test_regular_ke_invalid)
 
 	charon->ike_sa_manager->flush(charon->ike_sa_manager);
 }
+
+START_TEST(test_regular_ke_invalid)
+{
+	exchange_test_sa_conf_t conf = {
+		.initiator = {
+			.ike = "aes128-sha256-modp2048-modp3072",
+		},
+		.responder = {
+			.ike = "aes128-sha256-modp3072-modp2048",
+		},
+	};
+	_test_regular_ke_invalid(_i, FALSE, &conf);
+}
+END_TEST
+
+START_TEST(test_regular_ke_invalid_qske)
+{
+	exchange_test_sa_conf_t conf = {
+		.initiator = {
+			.ike = "aes128-sha256-modp2048-modp3072-qskenewhope5",
+		},
+		.responder = {
+			.ike = "aes128-sha256-modp3072-modp2048-qskenewhope5",
+		},
+	};
+	_test_regular_ke_invalid(_i, TRUE, &conf);
+}
 END_TEST
 
 /**
  * Both peers initiate the IKE_SA rekeying concurrently and should handle the
  * collision properly depending on the nonces.
  */
-START_TEST(test_collision)
+static void _test_collision(int _i, bool qske, exchange_test_sa_conf_t *conf)
 {
 	ike_sa_t *a, *b, *sa;
 	status_t status;
 
 	exchange_test_helper->establish_sa(exchange_test_helper,
-									   &a, &b, NULL);
+									   &a, &b, conf);
 
 	/* When rekeyings collide we get two IKE_SAs with a total of four nonces.
 	 * The IKE_SA with the lowest nonce SHOULD be deleted by the peer that
@@ -250,22 +330,50 @@ START_TEST(test_collision)
 	exchange_test_helper->nonce_first_byte = data[_i].nonces[1];
 	initiate_rekey(b);
 
+	assert_hook_not_called(ike_rekey);
+
 	/* CREATE_CHILD_SA { SA, Ni, KEi } --> */
 	exchange_test_helper->nonce_first_byte = data[_i].nonces[2];
-	assert_hook_not_called(ike_rekey);
 	exchange_test_helper->process_message(exchange_test_helper, b, NULL);
 	assert_ike_sa_state(b, IKE_REKEYING);
 	assert_child_sa_count(b, 1);
 	assert_ike_sa_count(0);
-	assert_hook();
 
 	/* <-- CREATE_CHILD_SA { SA, Ni, KEi } */
 	exchange_test_helper->nonce_first_byte = data[_i].nonces[3];
-	assert_hook_not_called(ike_rekey);
 	exchange_test_helper->process_message(exchange_test_helper, a, NULL);
 	assert_ike_sa_state(a, IKE_REKEYING);
 	assert_child_sa_count(a, 1);
 	assert_ike_sa_count(0);
+
+	if (qske)
+	{
+		/* <-- CREATE_CHILD_SA { SA, Nr, KEr } */
+		exchange_test_helper->process_message(exchange_test_helper, a, NULL);
+		assert_ike_sa_state(a, IKE_REKEYING);
+		assert_child_sa_count(a, 1);
+		assert_ike_sa_count(0);
+
+		/* CREATE_CHILD_SA { SA, Ni, KEi } --> */
+		exchange_test_helper->process_message(exchange_test_helper, b, NULL);
+		assert_ike_sa_state(b, IKE_REKEYING);
+		assert_child_sa_count(b, 1);
+		assert_ike_sa_count(0);
+
+		/* IKE_AUX { QSKE } --> */
+		assert_single_payload(IN, PLV2_QSKE);
+		exchange_test_helper->process_message(exchange_test_helper, b, NULL);
+		assert_ike_sa_state(b, IKE_REKEYING);
+		assert_child_sa_count(b, 1);
+		assert_ike_sa_count(0);
+
+		/* <-- IKE_AUX { QSKE } */
+		assert_single_payload(IN, PLV2_QSKE);
+		exchange_test_helper->process_message(exchange_test_helper, a, NULL);
+		assert_ike_sa_state(a, IKE_REKEYING);
+		assert_child_sa_count(a, 1);
+		assert_ike_sa_count(0);
+	}
 	assert_hook();
 
 	/* simplify next steps by checking in original IKE_SAs */
@@ -273,7 +381,7 @@ START_TEST(test_collision)
 	charon->ike_sa_manager->checkin(charon->ike_sa_manager, b);
 	assert_ike_sa_count(2);
 
-	/* <-- CREATE_CHILD_SA { SA, Nr, KEr } */
+	/* <-- CREATE_CHILD_SA { SA, Nr, KEr } | IKE_AUX { QSKE } */
 	assert_hook_rekey(ike_rekey, 1, data[_i].spi_i);
 	exchange_test_helper->process_message(exchange_test_helper, a, NULL);
 	/* as original initiator a is initiator of both SAs it could delete */
@@ -292,7 +400,7 @@ START_TEST(test_collision)
 	assert_ike_sa_count(4);
 	assert_hook();
 
-	/* CREATE_CHILD_SA { SA, Nr, KEr } --> */
+	/* CREATE_CHILD_SA { SA, Nr, KEr } | IKE_AUX { QSKE } --> */
 	assert_hook_rekey(ike_rekey, 1, data[_i].spi_i);
 	exchange_test_helper->process_message(exchange_test_helper, b, NULL);
 	/* if b wins it deletes the SA originally initiated by a */
@@ -355,6 +463,17 @@ START_TEST(test_collision)
 	assert_hook();
 
 	charon->ike_sa_manager->flush(charon->ike_sa_manager);
+}
+
+START_TEST(test_collision)
+{
+	_test_collision(_i, FALSE, NULL);
+}
+END_TEST
+
+START_TEST(test_collision_qske)
+{
+	_test_collision(_i, TRUE, &qske_conf);
 }
 END_TEST
 
@@ -1462,25 +1581,28 @@ Suite *ike_rekey_suite_create()
 
 	s = suite_create("ike rekey");
 
-	tc = tcase_create("regular");
-	tcase_add_loop_test(tc, test_regular, 0, 2);
-	tcase_add_loop_test(tc, test_regular_ke_invalid, 0, 2);
-	suite_add_tcase(s, tc);
+	// tc = tcase_create("regular");
+	// tcase_add_loop_test(tc, test_regular, 0, 2);
+	// tcase_add_loop_test(tc, test_regular_qske, 0, 2);
+	// tcase_add_loop_test(tc, test_regular_ke_invalid, 0, 2);
+	// tcase_add_loop_test(tc, test_regular_ke_invalid_qske, 0, 2);
+	// suite_add_tcase(s, tc);
 
 	tc = tcase_create("collisions rekey");
-	tcase_add_loop_test(tc, test_collision, 0, 4);
-	tcase_add_loop_test(tc, test_collision_ke_invalid, 0, 4);
-	tcase_add_loop_test(tc, test_collision_ke_invalid_delayed_retry, 0, 3);
-	tcase_add_loop_test(tc, test_collision_delayed_response, 0, 4);
-	tcase_add_loop_test(tc, test_collision_dropped_request, 0, 3);
-	tcase_add_loop_test(tc, test_collision_delayed_request, 0, 3);
-	tcase_add_loop_test(tc, test_collision_delayed_request_and_delete, 0, 3);
+	//tcase_add_loop_test(tc, test_collision, 0, 4);
+	tcase_add_loop_test(tc, test_collision_qske, 0, 4);
+	// tcase_add_loop_test(tc, test_collision_ke_invalid, 0, 4);
+	// tcase_add_loop_test(tc, test_collision_ke_invalid_delayed_retry, 0, 3);
+	// tcase_add_loop_test(tc, test_collision_delayed_response, 0, 4);
+	// tcase_add_loop_test(tc, test_collision_dropped_request, 0, 3);
+	// tcase_add_loop_test(tc, test_collision_delayed_request, 0, 3);
+	// tcase_add_loop_test(tc, test_collision_delayed_request_and_delete, 0, 3);
 	suite_add_tcase(s, tc);
 
-	tc = tcase_create("collisions delete");
-	tcase_add_loop_test(tc, test_collision_delete, 0, 2);
-	tcase_add_loop_test(tc, test_collision_delete_drop_delete, 0, 2);
-	suite_add_tcase(s, tc);
+	// tc = tcase_create("collisions delete");
+	// tcase_add_loop_test(tc, test_collision_delete, 0, 2);
+	// tcase_add_loop_test(tc, test_collision_delete_drop_delete, 0, 2);
+	// suite_add_tcase(s, tc);
 
 	return s;
 }
