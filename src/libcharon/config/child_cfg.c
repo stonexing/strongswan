@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2017 Tobias Brunner
+ * Copyright (C) 2008-2018 Tobias Brunner
  * Copyright (C) 2016 Andreas Steffen
  * Copyright (C) 2005-2007 Martin Willi
  * Copyright (C) 2005 Jan Hutter
@@ -502,23 +502,23 @@ METHOD(child_cfg_t, get_close_action, action_t,
 	return this->close_action;
 }
 
-METHOD(child_cfg_t, get_dh_group, diffie_hellman_group_t,
-	private_child_cfg_t *this)
+METHOD(child_cfg_t, get_algorithm, uint16_t,
+	private_child_cfg_t *this, transform_type_t type)
 {
 	enumerator_t *enumerator;
 	proposal_t *proposal;
-	uint16_t dh_group = MODP_NONE;
+	uint16_t alg = 0;
 
 	enumerator = this->proposals->create_enumerator(this->proposals);
 	while (enumerator->enumerate(enumerator, &proposal))
 	{
-		if (proposal->get_algorithm(proposal, DIFFIE_HELLMAN_GROUP, &dh_group, NULL))
+		if (proposal->get_algorithm(proposal, type, &alg, NULL))
 		{
 			break;
 		}
 	}
 	enumerator->destroy(enumerator);
-	return dh_group;
+	return alg;
 }
 
 METHOD(child_cfg_t, get_inactivity, uint32_t,
@@ -662,7 +662,7 @@ child_cfg_t *child_cfg_create(char *name, child_cfg_create_t *data)
 			.get_dpd_action = _get_dpd_action,
 			.get_close_action = _get_close_action,
 			.get_lifetime = _get_lifetime,
-			.get_dh_group = _get_dh_group,
+			.get_algorithm = _get_algorithm,
 			.get_inactivity = _get_inactivity,
 			.get_reqid = _get_reqid,
 			.get_mark = _get_mark,
