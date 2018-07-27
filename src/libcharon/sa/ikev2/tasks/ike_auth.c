@@ -936,6 +936,7 @@ static bool apply_ppk(private_ike_auth_t *this)
 		{
 			return FALSE;
 		}
+		this->ike_sa->set_condition(this->ike_sa, COND_PPK, TRUE);
 	}
 	clear_ppk(this);
 	return TRUE;
